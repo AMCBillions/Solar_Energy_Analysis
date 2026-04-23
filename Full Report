@@ -1,0 +1,379 @@
+# Brazilian PV Plant — Full Data Analysis Report
+
+**Project:** Brazillian-PV-Analysis  
+**Period:** April 1 – June 29, 2024  
+**Organisation:** chibambamulenga-org  
+**Prepared:** 2026
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Dataset Overview](#2-dataset-overview)
+3. [Data Quality Assessment](#3-data-quality-assessment)
+4. [Fleet Performance Overview](#4-fleet-performance-overview)
+5. [Inverter Underperformance Analysis](#5-inverter-underperformance-analysis)
+6. [Fault & Event Analysis](#6-fault--event-analysis)
+7. [Weather & Irradiance](#7-weather--irradiance)
+8. [Revenue Analysis](#8-revenue-analysis)
+9. [Recommendations & Next Steps](#9-recommendations--next-steps)
+10. [Appendix — Data Cleaning Notes](#10-appendix--data-cleaning-notes)
+
+---
+
+## 1. Executive Summary
+
+This report presents a full exploratory data analysis (EDA) of a utility-scale photovoltaic (PV) plant in Brazil. The dataset spans three months (April–June 2024) and comprises approximately 100,000 records across three data sources: grid export logs, inverter SCADA telemetry, and weather station readings.
+
+**Over the 90-day period, the plant exported 577,828 kWh of energy and generated $76,484 USD in revenue.** Fleet availability was strong at 97.5%, and the average power factor of 0.96 is within acceptable operating parameters.
+
+However, the analysis identifies several issues requiring immediate attention:
+
+- **INV-03** is actively degrading, with a 26% output decline within the analysis period alone
+- **INV-01** is chronically underperforming at 9.6% below the fleet average
+- **INV-05** has a critical data quality bug: DC power values are recorded in Watts instead of kilowatts
+- Five distinct data quality issues across the three source files require remediation before production modelling
+
+---
+
+## 2. Dataset Overview
+
+### 2.1 Source Files
+
+The archive contains three CSV files covering the same 90-day window at different temporal resolutions:
+
+**`grid_export.csv`** — 34,560 rows × 9 columns, 30-minute intervals  
+Records energy injected into the grid and associated financial metrics per inverter. Columns include `export_timestamp`, `inverter_id`, `energy_kwh`, `reactive_power_kvar`, `curtailment_flag`, `tariff_rate`, `revenue_usd`, `power_factor`, and `frequency_hz`.
+
+**`inverter_scada.csv`** — 34,560 rows × 9 columns, 30-minute intervals  
+Raw SCADA telemetry from each inverter. Columns include `timestamp`, `inverter_id`, `dc_power_kw`, `ac_power_kw`, `dc_voltage_v`, `dc_current_a`, `module_temp_c`, `inverter_efficiency`, and `status_code`.
+
+**`weather_stations.csv`** — 25,920 rows × 13 columns, 15-minute intervals  
+Environmental readings from three geographically distributed stations (WS-North, WS-Central, WS-South). Columns include irradiance components (GHI, DNI, DHI), ambient temperature, wind speed, relative humidity, barometric pressure, solar zenith angle, cloud opacity, and precipitation.
+
+### 2.2 Asset Configuration
+
+| Asset | Count | IDs |
+|-------|-------|-----|
+| Inverters | 8 | INV-01 through INV-08 |
+| Weather stations | 3 | WS-North, WS-Central, WS-South |
+
+### 2.3 Temporal Coverage
+
+All three files cover April 1 to June 29, 2024 — a 90-day period spanning the beginning of the Southern Hemisphere autumn. The weather station readings are at 15-minute granularity (4× per hour), while SCADA and grid export are at 30-minute granularity (2× per hour).
+
+---
+
+## 3. Data Quality Assessment
+
+Before analysis, five data quality issues were identified and addressed.
+
+### 3.1 Sentinel values in `energy_kwh`
+
+**Scope:** 431 rows (1.25% of grid_export.csv)  
+**Issue:** The `energy_kwh` column contains values of exactly -9999, which is a common sentinel/error code used by SCADA systems to indicate a missing or invalid reading. If these values flow uncleaned into aggregations, they produce wildly incorrect totals (the raw sum is approximately -3.7 million kWh rather than the correct +577,828 kWh).  
+**Resolution:** All values ≤ 0 were clipped to 0 for energy aggregations. A more robust production fix would flag these as NULL.
+
+### 3.2 `inverter_efficiency` nulls (48%)
+
+**Scope:** 16,567 of 34,560 rows  
+**Issue:** Nearly half the `inverter_efficiency` column is null.  
+**Resolution:** This is expected behaviour — efficiency is only defined when both DC input and AC output are non-zero. Nighttime records (approximately half the day) will always be null for this column. No remediation required; filter to daytime records before using this column.
+
+### 3.3 Mixed temperature units in `weather_stations.csv`
+
+**Scope:** Entire `ambient_temp` column  
+**Issue:** The `temp_unit` column contains both 'C' and 'F' values, meaning some temperature readings are in Celsius and others in Fahrenheit. Without normalisation, thermal analysis will produce incorrect results.  
+**Resolution:** Applied conversion `(F - 32) × 5/9` where `temp_unit == 'F'`. After normalisation, all three stations show a mean ambient temperature of 24.8°C — suspiciously identical, suggesting possible interpolation or averaging in the source data.
+
+### 3.4 Mixed timestamp formats in `inverter_scada.csv`
+
+**Scope:** `timestamp` column  
+**Issue:** Two distinct date format patterns are present within the same column (ISO 8601 and a localised format). Standard `pd.to_datetime()` fails without `format='mixed'`.  
+**Resolution:** Use `pd.to_datetime(col, format='mixed')` at ingestion. The root cause should be investigated at the data pipeline level.
+
+### 3.5 INV-05 `dc_power_kw` unit mismatch
+
+**Scope:** All INV-05 SCADA records  
+**Issue:** INV-05's `dc_power_kw` values are approximately 1,000× larger than expected (e.g., 13,885 instead of ~13.9). Cross-referencing with AC output confirms the values are in Watts rather than kilowatts — for example, a `dc_power_kw` of 13,885 aligns perfectly with an `ac_power_kw` of 13.5 when interpreted as W not kW.  
+**Impact:** DC→AC efficiency calculations for INV-05 are entirely invalid (yielding values of ~0.001 instead of ~0.97). All INV-05 efficiency metrics have been excluded from this report.  
+**Resolution:** Divide INV-05 `dc_power_kw` by 1,000 at source.
+
+---
+
+## 4. Fleet Performance Overview
+
+### 4.1 Summary Statistics
+
+| Metric | Value |
+|--------|-------|
+| Total energy exported | 577,828 kWh |
+| Total revenue | $76,484 USD |
+| Average power factor | 0.960 |
+| Fleet curtailment rate | 1.41% |
+| SCADA availability (NORMAL status) | 97.5% |
+| Grid frequency mean | 50.0 Hz |
+| Peak generation hour | 12:00–13:00 (~104 kW avg AC) |
+
+### 4.2 Monthly Breakdown
+
+| Month | Energy (kWh) | Revenue (USD) | Avg GHI (W/m²) |
+|-------|-------------|---------------|----------------|
+| April 2024 | 186,902 | $24,735 | 278.1 |
+| May 2024 | 201,226 | $26,662 | 293.1 |
+| June 2024 | 189,701 | $25,087 | 299.4 |
+
+May was the strongest month by both energy and revenue. June saw slightly higher irradiance than May but lower energy output — consistent with the degradation of INV-03 beginning to affect fleet totals.
+
+### 4.3 Daily Generation Profile
+
+The fleet follows a clean bell-curve generation profile from 06:00 to 18:30, with peak output of ~104 kW average AC power occurring at 12:00–13:00. The profile is consistent with a tropical/subtropical site with high solar altitude at midday.
+
+| Hour | Avg AC Power (kW) |
+|------|------------------|
+| 06:00 | 18.9 |
+| 08:00 | 65.0 |
+| 10:00 | 95.6 |
+| 12:00 | 104.2 |
+| 14:00 | 89.1 |
+| 16:00 | 54.3 |
+| 18:00 | 12.7 |
+
+### 4.4 Power Factor
+
+All 34,560 grid export readings fall within the 0.90–1.00 power factor band:
+- 0.90–0.95 range: 12,960 readings (37.5%)
+- 0.95–1.00 range: 21,600 readings (62.5%)
+- No readings below 0.90
+
+The average power factor of 0.960 indicates the plant is operating well within grid compliance requirements. No reactive power compensation issues were identified.
+
+---
+
+## 5. Inverter Underperformance Analysis
+
+### 5.1 Energy Output Ranking
+
+| Inverter | Total Energy (kWh) | vs. Fleet Avg (72,228 kWh) | Deviation |
+|----------|--------------------|---------------------------|-----------|
+| INV-08 | 80,575 | +8,347 | **+11.6%** |
+| INV-07 | 78,577 | +6,349 | **+8.8%** |
+| INV-06 | 76,176 | +3,948 | **+5.5%** |
+| INV-05 | 73,685 | +1,457 | +2.0% |
+| INV-04 | 72,474 | +246 | +0.3% |
+| INV-02 | 67,374 | -4,854 | -6.7% |
+| INV-01 | 65,332 | -6,896 | **-9.6% ⚠** |
+| INV-03 | 63,636 | -8,592 | **-11.9% 🔴** |
+
+The spread between the best (INV-08) and worst (INV-03) performer is 16,939 kWh — a 26.6% gap on an identical asset.
+
+### 5.2 INV-03 Degradation Trend
+
+The most significant finding of this analysis is that **INV-03 is not merely underperforming — it is actively degrading within the analysis window.**
+
+Weekly energy output for INV-03 vs. INV-08 (reference):
+
+| Week | INV-03 (kWh) | INV-08 (kWh) | INV-03 vs INV-08 |
+|------|-------------|-------------|-----------------|
+| Wk 14 | 4,987 | 5,801 | -14% |
+| Wk 18 | 5,499 | 6,215 | -12% (peak) |
+| Wk 20 | 4,788 | 6,243 | -23% |
+| Wk 22 | 4,460 | 6,731 | -34% |
+| Wk 26 | 4,060 | 5,577 | -27% |
+
+INV-03's output peaked around week 18 at approximately 5,499 kWh/week and then fell progressively to 4,060 kWh/week by week 26 — a **26% intra-period decline**. INV-08 shows no such trend, and the fleet average remains stable, confirming this is not a weather-driven effect.
+
+### 5.3 DC→AC Conversion Efficiency
+
+Excluding INV-05 (due to the unit mismatch described in §3.5), DC→AC conversion efficiency is remarkably consistent across all inverters:
+
+| Inverter | DC→AC Efficiency |
+|----------|-----------------|
+| INV-04 | 97.04% |
+| INV-03 | 97.01% |
+| INV-02 | 97.00% |
+| INV-06 | 97.00% |
+| INV-08 | 97.00% |
+| INV-01 | 96.99% |
+| INV-07 | 96.99% |
+| INV-05 | N/A (unit bug) |
+
+The near-identical efficiency across all inverters is a critical finding: **the inverter electronics are healthy.** The performance gap between INV-03 and INV-08 is not caused by inverter degradation — it originates upstream on the DC side, meaning the solar panels, string wiring, or DC combiner boxes connected to INV-03 are the likely root cause.
+
+### 5.4 Curtailment by Inverter
+
+| Inverter | Curtailment Rate |
+|----------|-----------------|
+| INV-01 | 1.64% |
+| INV-06 | 1.57% |
+| INV-07 | 1.53% |
+| INV-02 | 1.50% |
+| INV-04 | 1.44% |
+| INV-08 | 1.27% |
+| INV-03 | 1.18% |
+| INV-05 | 1.18% |
+
+Curtailment rates are uniformly low (1.18–1.64%) and do not explain the performance gap. INV-03's lower curtailment rate is consistent with it simply producing less power, not with it being curtailed more.
+
+---
+
+## 6. Fault & Event Analysis
+
+### 6.1 Status Code Summary
+
+| Status | Count | % of Records |
+|--------|-------|-------------|
+| NORMAL | 33,842 | 97.92% |
+| FAULT | 293 | 0.85% |
+| MAINT | 245 | 0.71% |
+| COMM_FAIL | 180 | 0.52% |
+
+Fleet availability of 97.9% is strong. The 2.1% non-normal time is split across three categories.
+
+### 6.2 Fault Distribution by Inverter
+
+| Inverter | FAULT | MAINT | COMM_FAIL | Total Non-Normal |
+|----------|-------|-------|-----------|-----------------|
+| INV-01 | 40 | 30 | 27 | 97 |
+| INV-07 | 37 | 41 | 17 | 95 |
+| INV-05 | 37 | 34 | 24 | 95 |
+| INV-03 | 39 | 29 | 21 | 89 |
+| INV-02 | 36 | 29 | 24 | 89 |
+| INV-06 | 36 | 35 | 16 | 87 |
+| INV-04 | 34 | 27 | 30 | 91 |
+| INV-08 | 34 | 20 | 21 | 75 |
+
+No single inverter dominates the fault count. The distribution is close to uniform (34–40 faults each), suggesting fleet-wide rather than asset-specific triggers.
+
+### 6.3 Fault Duration Analysis
+
+| Statistic | Value |
+|-----------|-------|
+| Median duration | 30 minutes |
+| Mean duration | 30.3 minutes |
+| Maximum observed | 60 minutes |
+| Total fault events | 290 |
+
+The median fault duration of exactly 30 minutes — which equals precisely one SCADA reporting interval — is highly diagnostic. This pattern is characteristic of **auto-recovery events**: the system logs a fault state and then self-clears before the next poll. It strongly suggests communication timeouts, soft resets, or SCADA polling failures rather than hardware failures.
+
+### 6.4 Temporal Distribution of Faults
+
+Faults are distributed across all 24 hours with no significant clustering at any particular time of day. This is the opposite of what would be expected from thermally-driven faults (which would peak in afternoon hours) or irradiance-related events. Combined with the 30-minute auto-recovery pattern, this further supports a **communication or logging artefact** interpretation.
+
+### 6.5 Pre-Fault Conditions
+
+Average DC power in the three readings preceding a FAULT event: **760 kW**. This is consistent with normal mid-generation operation, providing no evidence that overload conditions precede faults.
+
+---
+
+## 7. Weather & Irradiance
+
+### 7.1 Monthly Irradiance Trend
+
+| Month | Mean GHI (W/m²) | Mean DNI (W/m²) | Mean DHI (W/m²) |
+|-------|----------------|----------------|----------------|
+| April 2024 | 278.1 | — | — |
+| May 2024 | 293.1 | — | — |
+| June 2024 | 299.4 | — | — |
+
+GHI increases month-on-month, indicating improving solar resource through the analysis period. The increase from April to June (278 → 299 W/m²) represents a 7.6% improvement in available irradiance — yet total fleet energy output in June (189,701 kWh) was lower than May (201,226 kWh), consistent with INV-03 degradation offsetting the irradiance gain.
+
+### 7.2 Station Comparison
+
+All three weather stations (WS-North, WS-Central, WS-South) report a mean ambient temperature of exactly 24.8°C after unit normalisation. This uniformity across three geographically distributed stations is suspicious and may indicate that the temperature values are being averaged or interpolated at source rather than independently measured.
+
+### 7.3 Generation Window
+
+The generation window (AC power > 0) spans 06:00–18:30, consistent with a site located at approximately 15–25°S latitude during autumn months. The bell-curve peak at 12:00–13:00 is consistent with a fixed-tilt array without tracking.
+
+---
+
+## 8. Revenue Analysis
+
+### 8.1 Monthly Revenue
+
+| Month | Revenue (USD) | Energy (kWh) | Effective Rate ($/kWh) |
+|-------|-------------|-------------|----------------------|
+| April 2024 | $24,735 | 186,902 | $0.1323 |
+| May 2024 | $26,662 | 201,226 | $0.1324 |
+| June 2024 | $25,087 | 189,701 | $0.1322 |
+
+The effective tariff rate is remarkably stable at approximately $0.132/kWh across all three months, suggesting a fixed-rate export tariff rather than a time-of-use or market-indexed arrangement.
+
+### 8.2 Revenue Impact of Underperformance
+
+INV-03 and INV-01 together produced 128,968 kWh. Had they matched INV-08's output, they would have produced approximately 161,148 kWh — a shortfall of **~32,180 kWh**, equivalent to **~$4,252 USD** in unrealised revenue over 90 days. Annualised, this represents approximately $17,000 USD/year in lost revenue.
+
+---
+
+## 9. Recommendations & Next Steps
+
+### Priority 1 — Immediate (within 1 week)
+
+**INV-03 physical inspection**
+Schedule a string-level IV curve trace and visual inspection of all panels connected to INV-03. The 26% intra-period output decline is consistent with: progressive soiling across a string, partial shading from a new obstruction, a failing bypass diode, or a loose/corroded DC string connection. The fact that inverter efficiency is unaffected (97.0%) confirms the fault is upstream of the inverter.
+
+**Fix INV-05 dc_power_kw unit bug**
+Divide all `dc_power_kw` values for INV-05 by 1,000 at the data pipeline source. Verify against AC output readings after the fix.
+
+### Priority 2 — Short-term (within 1 month)
+
+**INV-01 investigation**
+INV-01 has been consistently 9.6% below fleet average for the entire 90-day period. Unlike INV-03, it shows no worsening trend, suggesting a persistent rather than progressive issue — possibly a partial string outage, module soiling on one sub-array, or a misconfigured MPPT channel.
+
+**Weather data temperature normalisation**
+Resolve the mixed °C/°F issue at source. Investigate why all three stations report identical mean temperatures — this may indicate a data averaging or interpolation issue in the weather station logger.
+
+### Priority 3 — Pipeline improvements
+
+**Sentinel value handling** — Replace -9999 values with NULL at ingestion rather than relying on downstream clipping.
+
+**Timestamp standardisation** — Enforce a single ISO 8601 timestamp format in `inverter_scada.csv` at the SCADA system level.
+
+**Fault-weather correlation** — Cross-reference COMM_FAIL and FAULT events with precipitation and wind speed data to determine if environmental conditions are a contributing factor.
+
+**Automated underperformance alerting** — Implement a weekly rolling comparison of inverter output against fleet average; trigger an alert when any inverter deviates by more than 10% for two consecutive weeks.
+
+---
+
+## 10. Appendix — Data Cleaning Notes
+
+### Python cleaning code
+
+```python
+import pandas as pd
+
+# Load
+grid = pd.read_csv('grid_export.csv')
+scada = pd.read_csv('inverter_scada.csv')
+weather = pd.read_csv('weather_stations.csv')
+
+# Parse timestamps
+grid['export_timestamp'] = pd.to_datetime(grid['export_timestamp'])
+scada['timestamp'] = pd.to_datetime(scada['timestamp'], format='mixed')
+weather['reading_time'] = pd.to_datetime(weather['reading_time'])
+
+# Clean energy sentinel values
+grid['energy_kwh_clean'] = grid['energy_kwh'].clip(lower=0)
+
+# Normalise temperature to Celsius
+weather['ambient_temp_c'] = weather.apply(
+    lambda r: (r['ambient_temp'] - 32) * 5/9
+    if r['temp_unit'] == 'F' else r['ambient_temp'],
+    axis=1
+)
+
+# Fix INV-05 dc_power_kw unit bug
+scada.loc[scada['inverter_id'] == 'INV-05', 'dc_power_kw'] /= 1000
+```
+
+### BigQuery project reference
+
+- **Project ID:** `brazillian-pv-analysis`
+- **Organisation:** `chibambamulenga-org`
+- **Project number:** 576963220233
+
+---
+
+*End of report*
